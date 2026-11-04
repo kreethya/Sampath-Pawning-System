@@ -1,0 +1,193 @@
+<?php
+
+namespace Tests\Unit;
+
+use App\Models\TPawnSum;
+use App\Services\ReceiptFinancialCalculator;
+use App\Services\ReceiptHistoryService;
+use Tests\TestCase;
+
+class ReceiptLedgerChronologyTest extends TestCase
+{
+    public function test_ledger_runs_oldest_to_newest_with_current_balance_at_the_end(): void
+    {
+        $service = new ReceiptHistoryService(new ReceiptFinancialCalculator());
+        $receipt = new TPawnSum(['Receipt_Number' => 'TEST', 'Invoice_Number' => 'STOCK', 'BC' => '001']);
+        $rows = collect([
+            (object) [
+                'id' => 2, 'dDate' => '2026-02-01', 'trans_type' => 'REDEEM',
+                'OC' => null, 'Paided_Interest' => 0, 'Discount' => 0,
+                'payable_total' => 100, 'Dr_amount' => 100, 'Extend_Date' => null,
+            ],
+            (object) [
+                'id' => 1, 'dDate' => '2026-01-01', 'trans_type' => 'PAWN',
+                'OC' => null, 'remaining_capital' => 100, 'trans_pawn_amount' => 100,
+                'Cr_amount' => 100, 'trans_amount' => 100, 'Extend_Date' => null,
+            ],
+        ]);
+
+        $format = new \ReflectionMethod($service, 'formatLedgerRows');
+        $ledger = $format->invoke($service, $rows, $receipt);
+
+        $this->assertSame(['PAWN', 'REDEEM'], $ledger->pluck('type')->all());
+        $this->assertEquals(100, $ledger->first()['balance']);
+        $this->assertEquals(0, $ledger->last()['balance']);
+    }
+
+    public function test_non_financial_activity_follows_same_day_transaction_balance(): void
+    {
+        $service = new ReceiptHistoryService(new ReceiptFinancialCalculator());
+        $financial = collect([
+            ['date' => '2026-01-01', 'dr' => 100.0, 'cr' => 0.0, 'balance' => 100.0],
+            ['date' => '2026-02-01', 'dr' => 0.0, 'cr' => 40.0, 'balance' => 60.0],
+        ]);
+        $timeline = collect([[
+            'date' => '2026-02-01', 'type' => 'BLOCKED', 'details' => ['Operator' => 'admin'],
+        ]]);
+
+        $merge = new \ReflectionMethod($service, 'mergeNonFinancialActivity');
+        $ledger = $merge->invoke($service, $financial, $timeline);
+
+        $this->assertSame(['2026-01-01', '2026-02-01', '2026-02-01'], $ledger->pluck('date')->all());
+        $this->assertEquals(60, $ledger->last()['balance']);
+        $this->assertSame('BLOCKED', $ledger->last()['type']);
+    }
+
+    public function test_capitalized_part_payment_reconciles_ledger_and_explains_new_capital(): void
+    {
+        $service = new ReceiptHistoryService(new ReceiptFinancialCalculator());
+        $receipt = new TPawnSum(['Receipt_Number' => 'TEST', 'Invoice_Number' => 'STOCK']);
+        $rows = collect([
+            (object) [
+                'id' => 1, 'dDate' => '2026-10-01', 'trans_type' => 'PAWN',
+                'OC' => null, 'remaining_capital' => 5000, 'trans_pawn_amount' => 5000,
+                'Cr_amount' => 5000, 'trans_amount' => 5000,
+            ],
+            (object) [
+                'id' => 2, 'dDate' => '2026-10-07', 'trans_type' => 'PART_PAYMENT',
+                'OC' => null, 'Paided_Interest' => 150, 'allocation_interest_due' => 200,
+                'capitalized_interest' => 50, 'Paided_Captional' => 0,
+                'historical_capital' => 5050, 'remaining_capital' => 5050,
+                'payable_total' => 150, 'Dr_amount' => 150,
+            ],
+        ]);
+
+        $format = new \ReflectionMethod($service, 'formatLedgerRows');
+        $ledger = $format->invoke($service, $rows, $receipt);
+
+        $this->assertSame(['PAWN', 'INTEREST_CHARGE', 'PART_PAYMENT'], $ledger->pluck('type')->all());
+        $this->assertSame(200.0, $ledger[1]['dr']);
+        $this->assertSame(150.0, $ledger[2]['cr']);
+        $this->assertSame(5050.0, $ledger->last()['balance']);
+        $this->assertStringContainsString('Interest added to capital: Rs. 50.00', $ledger[2]['summary']);
+        $this->assertContains('New capital: Rs. 5,050.00', $ledger[2]['details']);
+
+        // Legacy rows without an explicit allocation keep their recorded paid
+        // interest; their past balances are not retroactively capitalized.
+        unset($rows[1]->allocation_interest_due, $rows[1]->capitalized_interest);
+        $legacy = $format->invoke($service, $rows, $receipt);
+        $this->assertSame(150.0, $legacy[1]['dr']);
+        $this->assertSame(5000.0, $legacy->last()['balance']);
+    }
+
+    public function test_interest_capitalization_with_discount_has_matching_credit(): void
+    {
+        $service = new ReceiptHistoryService(new ReceiptFinancialCalculator());
+        $receipt = new TPawnSum(['Receipt_Number' => 'TEST', 'Invoice_Number' => 'STOCK']);
+        $rows = collect([
+            (object) ['id'=>1, 'dDate'=>'2026-10-01', 'trans_type'=>'PAWN', 'OC'=>null,
+                'remaining_capital'=>5000, 'Cr_amount'=>5000, 'trans_amount'=>5000],
+            (object) ['id'=>2, 'dDate'=>'2026-10-07', 'trans_type'=>'PART_PAYMENT', 'OC'=>null,
+                'Paided_Interest'=>100, 'allocation_interest_due'=>200, 'allocation_discount'=>50,
+                'capitalized_interest'=>50, 'Paided_Captional'=>0, 'remaining_capital'=>5050,
+                'payable_total'=>100, 'Dr_amount'=>100],
+        ]);
+
+        $format = new \ReflectionMethod($service, 'formatLedgerRows');
+        $ledger = $format->invoke($service, $rows, $receipt);
+
+        $this->assertSame(['PAWN', 'INTEREST_CHARGE', 'DISCOUNT', 'PART_PAYMENT'], $ledger->pluck('type')->all());
+        $this->assertSame(5050.0, $ledger->last()['balance']);
+    }
+
+    public function test_partial_payment_after_letters_reconciles_postage_and_new_capital(): void
+    {
+        $service = new ReceiptHistoryService(new ReceiptFinancialCalculator());
+        $receipt = new TPawnSum(['Receipt_Number' => 5542, 'Invoice_Number' => 5542, 'BC' => '002']);
+        $rows = collect([
+            (object) ['id'=>1, 'dDate'=>'2026-02-01', 'trans_type'=>'PAWN', 'OC'=>null,
+                'remaining_capital'=>35308, 'Cr_amount'=>35308, 'trans_amount'=>35308],
+            (object) ['id'=>2, 'dDate'=>'2026-09-07', 'trans_type'=>'LETTER 1 CHARGE', 'OC'=>null,
+                'trans_amount'=>125, 'Postage_charge'=>125],
+            (object) ['id'=>3, 'dDate'=>'2026-10-08', 'trans_type'=>'LETTER 2 CHARGE', 'OC'=>null,
+                'trans_amount'=>125, 'Postage_charge'=>125],
+            (object) ['id'=>4, 'dDate'=>'2026-10-11', 'trans_type'=>'PART_PAYMENT', 'OC'=>null,
+                'Paided_Interest'=>150, 'allocation_interest_due'=>7502.95,
+                'capitalized_interest'=>7352.95, 'capitalized_charges'=>250,
+                'Paided_Captional'=>0, 'remaining_capital'=>42910.95,
+                'payable_total'=>150, 'Dr_amount'=>150],
+        ]);
+
+        $format = new \ReflectionMethod($service, 'formatLedgerRows');
+        $ledger = $format->invoke($service, $rows, $receipt);
+
+        $this->assertSame(42910.95, $ledger->last()['balance']);
+        $this->assertStringContainsString('Charges added to capital: Rs. 250.00', $ledger->last()['summary']);
+        $this->assertContains('New capital: Rs. 42,910.95', $ledger->last()['details']);
+    }
+
+    public function test_only_explicit_allocation_event_marks_a_part_payment_as_capitalized(): void
+    {
+        $service = new ReceiptHistoryService(new ReceiptFinancialCalculator());
+        $rows = collect([
+            (object) ['id'=>1, 'trans_type'=>'PART_PAYMENT', 'Paided_Interest'=>150],
+            (object) ['id'=>2, 'trans_type'=>'PART_PAYMENT', 'Paided_Interest'=>150],
+        ]);
+        $event = (object) ['event_data'=>json_encode([
+            'transaction_id'=>2, 'interest_due'=>200,
+            'capitalized_interest'=>50, 'capitalized_charges'=>125, 'discount'=>0,
+        ])];
+
+        $apply = new \ReflectionMethod($service, 'applyPartPaymentAllocations');
+        $apply->invoke($service, $rows, collect([$event]));
+
+        $this->assertFalse(property_exists($rows[0], 'capitalized_interest'));
+        $this->assertSame(50.0, $rows[1]->capitalized_interest);
+        $this->assertSame(125.0, $rows[1]->capitalized_charges);
+        $this->assertSame(200.0, $rows[1]->allocation_interest_due);
+    }
+
+    public function test_print_history_uses_the_same_order_and_expands_all_details(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Number' => 4549,
+            'Invoice_Number' => 769145,
+            'Receipt_Date' => '2026-04-05',
+            'Final_date' => '2027-04-05',
+        ]);
+        $history = [
+            'receipt' => $receipt,
+            'customer' => null,
+            'financial' => [
+                'principal' => 0, 'interest' => 0, 'service_charge' => 0,
+                'letter_charge' => 0, 'arrears_total' => 0, 'redemption_total' => 0,
+            ],
+            'ledger' => collect([
+                ['date' => '2026-04-05', 'description' => 'Pawn receipt issued',
+                    'summary' => 'Capital: Rs. 40,000.00', 'details' => ['Capital: Rs. 40,000.00'],
+                    'dr' => 40000, 'cr' => 0, 'balance' => 40000, 'operator' => 'Cashier'],
+                ['date' => '2026-04-28', 'description' => 'Receipt redeemed',
+                    'summary' => 'Customer paid: Rs. 40,000.00', 'details' => ['Paid interest: Rs. 0.00'],
+                    'dr' => 0, 'cr' => 40000, 'balance' => 0, 'operator' => 'Cashier'],
+            ]),
+        ];
+
+        $html = view('receiptHistoryPrint', compact('history'))->render();
+
+        $this->assertStringContainsString('<th>Capital</th>', $html);
+        $this->assertStringContainsString('Oldest First', $html);
+        $this->assertTrue(strpos($html, 'Pawn receipt issued') < strpos($html, 'Receipt redeemed'));
+        $this->assertStringNotContainsString('ledger-detail-row d-none', $html);
+        $this->assertStringContainsString('Ledger totals / Current balance', $html);
+    }
+}

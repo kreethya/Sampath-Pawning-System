@@ -1,0 +1,533 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Company;
+use App\Models\Recei_Add;
+use App\Models\TPawnSum;
+use App\Models\TPawnTrans;
+use App\Models\TPawnDetails;
+use App\Models\branchDel;
+use App\Models\Customer;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use App\Models\ArrearsLetterEvent;
+use App\Services\ArrearsLetterService;
+use App\Services\ReceiptFinancialCalculator;
+use App\Services\ReceiptLifecycleService;
+use App\Services\ReceiptTypeResolver;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+
+class RedeemLateLettersController extends Controller
+{
+    private const LATEST_CYCLE_DATE_SQL = 'latest_letter_cycle.dDate';
+
+    // ══════════════════════════════════════════════════════════════
+    // INDEX — main Late Letters listing page
+    // ══════════════════════════════════════════════════════════════
+    public function index(Request $request, ?ReceiptFinancialCalculator $calculator = null, ?ReceiptTypeResolver $resolver = null)
+    {
+        $calculator  = $calculator ?? app(ReceiptFinancialCalculator::class);
+        $resolver    = $resolver ?? app(ReceiptTypeResolver::class);
+        return $this->buildView($request, $calculator, $resolver);
+    }
+
+
+    // ══════════════════════════════════════════════════════════════
+    // PRINT INDEX — date-filtered print list
+    // ══════════════════════════════════════════════════════════════
+    public function printIndex(Request $request)
+    {
+        $branch_code     = auth()->user()->BC;
+        $fromDate        = $request->input('from_date');
+        $toDate          = $request->input('to_date');
+        $currentDateTime = now();
+
+        $schedule = new \App\Services\ReceiptPenaltySchedule();
+        $query = TPawnSum::where('IsRedeemed', 0)->where('isForfeit', 0)
+            ->where('BC', $branch_code)
+            ->whereRaw($schedule->expirySql().' <= ?', [$currentDateTime->toDateString()]);
+
+        if ($fromDate && $toDate) {
+            $query->where(function ($dates) use ($fromDate, $toDate) {
+                $dates->whereBetween('letter_3_date', [$fromDate, $toDate])
+                    ->orWhereBetween('letter_2_date', [$fromDate, $toDate])
+                    ->orWhereBetween('letter_1_date', [$fromDate, $toDate]);
+            });
+        }
+        $oldPawns = $query->get();
+
+        return view('late_redeem_print_list')
+            ->with('toDate', $toDate)
+            ->with('fromDate', $fromDate)
+            ->with('recipts', $oldPawns);
+    }
+
+
+    // ══════════════════════════════════════════════════════════════
+    // PRINT (AJAX/JSON) — update letter flag, return JSON
+    // ══════════════════════════════════════════════════════════════
+    public function print(Request $request, ArrearsLetterService $letterService)
+    {
+        $receipt = TPawnSum::where('Receipt_Number', $request->print_recept_no)
+            ->where('BC', auth()->user()->BC)->firstOrFail();
+        $event = $letterService->issue($receipt->id, auth()->user()->BC, (int) $request->letter_no);
+
+        return response()->json(['status' => 'success', 'event_id' => $event->id]);
+    }
+
+
+    // ══════════════════════════════════════════════════════════════
+    // LATE REDEEM — filter by receipt type
+    // ══════════════════════════════════════════════════════════════
+    public function LateRedeem(Request $request, ?ReceiptFinancialCalculator $calculator = null, ?ReceiptTypeResolver $resolver = null)
+    {
+        $calculator  = $calculator ?? app(ReceiptFinancialCalculator::class);
+        $resolver    = $resolver ?? app(ReceiptTypeResolver::class);
+        return $this->buildView($request, $calculator, $resolver);
+    }
+
+    /**
+     * Shared view builder for index + LateRedeem — handles per-tab pagination.
+     */
+    private function buildView(Request $request, ReceiptFinancialCalculator $calculator, ReceiptTypeResolver $resolver)
+    {
+        $branch_code = auth()->user()->BC;
+        $activeTab   = (int) $request->input('tab', 1);
+        if ($activeTab < 1 || $activeTab > 3) $activeTab = 1;
+        $showPrinted = $request->input('show_printed', '1') !== '0';
+        $schedule = new \App\Services\ReceiptPenaltySchedule();
+        $searchNotice = null;
+        $searchNoticeLink = null;
+
+        if ($request->filled('receipt_number')) {
+            $searched = TPawnSum::where('BC', $branch_code)
+                ->where('Receipt_Number', $request->receipt_number)->first();
+            if (!$searched) {
+                $searchNotice = 'No receipt with this number was found in this branch.';
+            } elseif ($searched->IsRedeemed || $searched->isForfeit) {
+                $searchNotice = 'This receipt is already redeemed or forfeited, so it is not in Late Letters.';
+            } elseif ($searched->forfeit_queued_at) {
+                $searchNotice = 'This receipt has moved to the Forfeit Receipt List.';
+                $searchNoticeLink = route('forfeitReceipt_List', ['receipt_number' => $searched->Receipt_Number]);
+            } elseif ($schedule->expiryDate($searched)->gt(today())) {
+                $searchNotice = 'This receipt has not expired; its current expiry date is '
+                    .$schedule->expiryDate($searched)->toDateString().'.';
+            } elseif ($this->hasPriorCycleLetters($searched)) {
+                $activeTab = 1;
+                $showPrinted = true;
+                $searchNotice = 'This receipt has expired again and is listed in the first-letter tab. '
+                    .'Its old letter and postage history needs review before a new letter can be issued.';
+            } elseif ($searched->is_letter_3 && $schedule->reminderIsDue($searched)) {
+                $searchNotice = 'The third letter is complete. This receipt is now in the Forfeit Reminder stage.';
+                $searchNoticeLink = route('forfeit.reminders.index', ['receipt_number' => $searched->Receipt_Number]);
+            } else {
+                $activeTab = $this->currentLetterTab($searched, $schedule);
+                // An exact receipt lookup must not silently hide a printed row.
+                $showPrinted = true;
+                if (!$searched->is_letter_1 && $schedule->letterDueDate($searched, 1)->gt(today())) {
+                    $searchNotice = 'This receipt has expired and is listed below. Its first letter can be printed from '
+                        .$schedule->letterDueDate($searched, 1)->toDateString().'.';
+                }
+            }
+        }
+
+        // Load only the active tab's paginated data
+        $tab1 = $activeTab === 1 ? $this->eligibleReceipts($request, $branch_code, $calculator, 1, $showPrinted) : null;
+        $tab2 = $activeTab === 2 ? $this->eligibleReceipts($request, $branch_code, $calculator, 2, $showPrinted) : null;
+        $tab3 = $activeTab === 3 ? $this->eligibleReceipts($request, $branch_code, $calculator, 3, $showPrinted) : null;
+
+        // Total counts per tab (cheap COUNT queries, no data hydration)
+        $baseCount = $this->lateLettersBaseQuery($branch_code);
+        if ($request->filled('receipt_type') && !$request->filled('receipt_number')) { $this->applyTypeFilter($baseCount, $request->receipt_type); }
+        if ($request->filled('receipt_number')) { $baseCount->where('Receipt_Number', $request->receipt_number); }
+        $count_1st = $this->applyPrintedVisibility($this->applyStageFilter(clone $baseCount, $schedule, 1, self::LATEST_CYCLE_DATE_SQL), 1, $showPrinted, self::LATEST_CYCLE_DATE_SQL)->count();
+        $count_2nd = $this->applyPrintedVisibility($this->applyStageFilter(clone $baseCount, $schedule, 2, self::LATEST_CYCLE_DATE_SQL), 2, $showPrinted, self::LATEST_CYCLE_DATE_SQL)->count();
+        $count_3rd = $this->applyPrintedVisibility($this->applyStageFilter(clone $baseCount, $schedule, 3, self::LATEST_CYCLE_DATE_SQL), 3, $showPrinted, self::LATEST_CYCLE_DATE_SQL)->count();
+
+        $companyData = Company::latest()->paginate(1);
+        $receiptType = $resolver->getActiveTypes();
+
+        return view('redeem_late_letter', compact(
+            'receiptType', 'companyData',
+            'tab1', 'tab2', 'tab3',
+            'count_1st', 'count_2nd', 'count_3rd',
+            'activeTab', 'showPrinted', 'searchNotice', 'searchNoticeLink'
+        ));
+    }
+
+
+    // ══════════════════════════════════════════════════════════════
+    // LATE REDEEM LETTER LIST — today's printed letters summary
+    // ══════════════════════════════════════════════════════════════
+public function LateRedeemLetterList(Request $request)
+{
+    $branch_code  = auth()->user()->BC;
+    $letterNumber = $request->get('letter', null);
+
+    // Date range — default to today if not provided
+    $fromDate = $request->get('from_date', now()->toDateString());
+    $toDate   = $request->get('to_date', now()->toDateString());
+
+    $query = TPawnSum::where('IsRedeemed', 0)
+        ->where('BC', $branch_code)
+        ->where('isForfeit', 0);
+
+    if ($letterNumber == 1) {
+        $query->whereBetween('letter_1_date', [$fromDate, $toDate])
+              ->where('is_letter_1', 1);
+    } elseif ($letterNumber == 2) {
+        $query->whereBetween('letter_2_date', [$fromDate, $toDate])
+              ->where('is_letter_2', 1);
+    } elseif ($letterNumber == 3) {
+        $query->whereBetween('letter_3_date', [$fromDate, $toDate])
+              ->where('is_letter_3', 1);
+    } else {
+        $query->where(function ($q) use ($fromDate, $toDate) {
+            $q->whereBetween('letter_1_date', [$fromDate, $toDate])
+              ->orWhereBetween('letter_2_date', [$fromDate, $toDate])
+              ->orWhereBetween('letter_3_date', [$fromDate, $toDate]);
+        })->where(function ($q) {
+            $q->where('is_letter_1', 1)
+              ->orWhere('is_letter_2', 1)
+              ->orWhere('is_letter_3', 1);
+        });
+    }
+
+    $receiptType    = $query->get();
+    $companyData    = Company::latest()->paginate(1);
+    $selectedLetter = $letterNumber;
+    $branchData     = branchDel::where('bccode', $branch_code)->first(); // returns single model or null
+
+    return view('lateRedeemLetterList', compact(
+        'receiptType', 'companyData', 'selectedLetter', 'fromDate', 'toDate', 'branchData'
+    ));
+}
+
+
+    // ══════════════════════════════════════════════════════════════
+    // PRINT LETTER VIEW — single receipt, opens in new tab
+    // Updates letter flag then renders gold_loan_notice_print view
+    // ══════════════════════════════════════════════════════════════
+    public function issue(Request $request, ArrearsLetterService $letterService)
+    {
+        $validated = $request->validate([
+            'pawn_sum_id' => ['required', 'integer'],
+            'letter_no' => ['required', Rule::in([1, 2, 3])],
+        ]);
+
+        $event = $letterService->issue((int) $validated['pawn_sum_id'], auth()->user()->BC, (int) $validated['letter_no']);
+
+        return response()->json([
+            'status' => 'success',
+            'print_url' => route('print_letter_view', ['event_id' => $event->id]),
+        ]);
+    }
+
+    public function issueBulk(Request $request, ArrearsLetterService $letterService)
+    {
+        $validated = $request->validate([
+            'pawn_sum_ids' => ['required', 'array', 'min:1'],
+            'pawn_sum_ids.*' => ['integer'],
+            'letter_no' => ['required', Rule::in([1, 2, 3])],
+        ]);
+        $eventIds = DB::transaction(function () use ($validated, $letterService) {
+            $ids = [];
+            foreach (array_unique($validated['pawn_sum_ids']) as $pawnSumId) {
+                $ids[] = $letterService->issue((int) $pawnSumId, auth()->user()->BC, (int) $validated['letter_no'])->id;
+            }
+            return $ids;
+        });
+
+        return response()->json([
+            'status' => 'success',
+            'print_url' => route('print_bulk_letters_view', ['event_ids' => $eventIds]),
+        ]);
+    }
+
+    public function printLetterView(Request $request, ?ReceiptFinancialCalculator $calculator = null, ?ReceiptTypeResolver $resolver = null)
+    {
+        $calculator  = $calculator ?? app(ReceiptFinancialCalculator::class);
+        $resolver    = $resolver ?? app(ReceiptTypeResolver::class);
+        $branch_code = auth()->user()->BC;
+        $event = ArrearsLetterEvent::where('id', $request->event_id)->where('BC', $branch_code)->firstOrFail();
+        $receipt = TPawnSum::where('id', $event->pawn_sum_id)->where('BC', $branch_code)->firstOrFail();
+        $this->applyCurrentCustomerContact($receipt);
+        $letter_no = (int) $event->letter_no;
+        $company = Company::latest()->first();
+        $receiptTypeModel = $resolver->resolveForReceipt($receipt);
+        $financial = $calculator->calculate($receipt);
+        $schedule = new \App\Services\ReceiptPenaltySchedule();
+        $letters = [[
+            'receipt' => $receipt,
+            'interest' => $financial['interest'],
+            'letter_no' => $letter_no,
+            'pawnDetails' => TPawnDetails::where('Receipt_Number', $receipt->Receipt_Number)->where('BC', $branch_code)->get(),
+            'receiptType' => $receiptTypeModel,
+            'branchDetails' => branchDel::where('bccode', $branch_code)->first(),
+            'financial' => $financial,
+            'expiry_date' => $schedule->expiryDate($receipt)->toDateString(),
+        ]];
+
+        return view('gold_loan_notice_bulk_print', compact('letters', 'company', 'letter_no'));
+    }
+
+
+    // ══════════════════════════════════════════════════════════════
+    // PRINT BULK LETTERS VIEW — multiple receipts in one tab
+    // Opens a single print-ready page with all selected letters,
+    // separated by page breaks.
+    // Updates the letter flag for every receipt before rendering.
+    //
+    // GET /print-bulk-letters?receipt_nos[]=X&receipt_nos[]=Y&letter_no=1
+    // ══════════════════════════════════════════════════════════════
+public function printBulkLettersView(Request $request, ?ReceiptFinancialCalculator $calculator = null, ?ReceiptTypeResolver $resolver = null)
+{
+    $calculator  = $calculator ?? app(ReceiptFinancialCalculator::class);
+    $resolver    = $resolver ?? app(ReceiptTypeResolver::class);
+    $branch_code = auth()->user()->BC;
+    $company = Company::latest()->first();
+    $letters = [];
+    $events = ArrearsLetterEvent::whereIn('id', (array) $request->input('event_ids', []))
+        ->where('BC', $branch_code)->orderBy('id')->get();
+    $letter_no = (int) optional($events->first())->letter_no;
+
+    foreach ($events as $event) {
+        $receipt = TPawnSum::where('id', $event->pawn_sum_id)->where('BC', $branch_code)->first();
+        if (!$receipt) {
+            continue;
+        }
+        $this->applyCurrentCustomerContact($receipt);
+        $receiptTypeModel = $resolver->resolveForReceipt($receipt);
+        $financial = $calculator->calculate($receipt);
+        $schedule = new \App\Services\ReceiptPenaltySchedule();
+        $letters[] = [
+            'receipt'     => $receipt,
+            'interest'    => $financial['interest'],
+            'letter_no'   => (int) $event->letter_no,
+            'pawnDetails' => TPawnDetails::where('Receipt_Number', $receipt->Receipt_Number)->where('BC', $branch_code)->get(),
+            'receiptType' => $receiptTypeModel,
+            'branchDetails'    => branchDel::where('bccode', $branch_code)->first(),
+            'financial' => $financial,
+            'expiry_date' => $schedule->expiryDate($receipt)->toDateString(),
+        ];
+    }
+
+    return view('gold_loan_notice_bulk_print', compact('letters', 'company', 'letter_no'));
+}
+
+    private function eligibleReceipts(Request $request, string $branchCode, ReceiptFinancialCalculator $calculator, int $tabLetter = 1, bool $showPrinted = true)
+    {
+        $perPage = 25;
+        $schedule = new \App\Services\ReceiptPenaltySchedule();
+
+        $baseQuery = $this->lateLettersBaseQuery($branchCode);
+
+        if ($request->filled('receipt_type') && !$request->filled('receipt_number')) {
+            $this->applyTypeFilter($baseQuery, $request->receipt_type);
+        }
+        if ($request->filled('receipt_number')) {
+            $baseQuery->where('Receipt_Number', $request->receipt_number);
+        }
+
+        $this->applyStageFilter($baseQuery, $schedule, $tabLetter, self::LATEST_CYCLE_DATE_SQL);
+        $this->applyPrintedVisibility($baseQuery, $tabLetter, $showPrinted, self::LATEST_CYCLE_DATE_SQL);
+
+        $baseQuery->selectRaw($schedule->expirySql(self::LATEST_CYCLE_DATE_SQL).' AS letter_effective_expiry_date')
+            ->addSelect('latest_letter_cycle.dDate AS latest_letter_cycle_date');
+        $paginated = $baseQuery
+            ->orderByRaw($schedule->expirySql(self::LATEST_CYCLE_DATE_SQL).' ASC')
+            ->orderBy('t_pawn_sums.id')
+            ->paginate($perPage)->withQueryString();
+
+        $receipts = $paginated->getCollection();
+
+        // Batch load customers to prevent N+1 queries
+        $nics = $receipts->pluck('Customer_NIC')->filter()->unique();
+        $customers = Customer::where('BC', $branchCode)->whereIn('NIC', $nics)->get()->keyBy('NIC');
+
+        $letterService = app(ArrearsLetterService::class);
+        $receipts->each(function (TPawnSum $receipt) use ($calculator, $schedule, $letterService, $customers, $tabLetter) {
+            $this->applyCurrentCustomerContact($receipt, $customers->get($receipt->Customer_NIC));
+            $receipt->setAttribute('financial_breakdown', $calculator->calculate($receipt));
+            $receipt->setAttribute('next_letter_no', $tabLetter);
+            $dueDate = $schedule->letterDueDate($receipt, $tabLetter);
+            $receipt->setAttribute('next_letter_due_date', $dueDate?->toDateString());
+            $needsReview = $this->hasPriorCycleLetters($receipt);
+            $receipt->setAttribute('letter_needs_review', $needsReview);
+            $receipt->setAttribute('letter_is_due', !$needsReview
+                && $letterService->isEligible($receipt, $tabLetter));
+            $receipt->setAttribute('next_stage_due_date', $tabLetter < 3
+                ? $schedule->letterDueDate($receipt, $tabLetter + 1)?->toDateString()
+                : optional($schedule->reminderDueDate($receipt))->toDateString());
+            $receipt->setAttribute('arrears_expiry_date', $schedule->expiryDate($receipt)->toDateString());
+        });
+
+        $paginated->setCollection($receipts);
+        return $paginated;
+    }
+
+    private function hasPriorCycleLetters(TPawnSum $receipt): bool
+    {
+        if (!$receipt->is_letter_1 && !$receipt->is_letter_2 && !$receipt->is_letter_3) return false;
+
+        $attributes = $receipt->getAttributes();
+        $latestCycleDate = array_key_exists('latest_letter_cycle_date', $attributes)
+            ? $receipt->latest_letter_cycle_date
+            : ($receipt->BC && $receipt->Receipt_Number ? DB::table('t_pawn_trans')
+                ->whereRaw('BINARY BC = BINARY ?', [$receipt->BC])
+                ->whereRaw('BINARY code = BINARY ?', [$receipt->Receipt_Number])
+                ->whereIn('trans_type', ['PART_PAYMENT', 'REPAWNING'])
+                ->orderByDesc('dDate')->orderByDesc('id')->value('dDate') : null);
+        $cycleStart = collect([$latestCycleDate, $receipt->RePawning_date, $receipt->Pawn_Date, $receipt->Receipt_Date])
+            ->filter()->map(fn ($date) => Carbon::parse($date)->startOfDay())->sort()->last();
+        if (!$cycleStart) return false;
+
+        foreach ([1, 2, 3] as $number) {
+            $printedAt = $receipt->{'letter_'.$number.'_date'};
+            if ($receipt->{'is_letter_'.$number} && $printedAt && $printedAt->lt($cycleStart)) return true;
+        }
+
+        return false;
+    }
+
+    private function lateLettersBaseQuery(string $branchCode)
+    {
+        // Compute the latest payment/repawn once per receipt for both filtering
+        // and sorting. A correlated transaction scan for every Silver row made
+        // expiry sorting prohibitively slow on the production database.
+        $rankedCycles = DB::table('t_pawn_trans')
+            ->select('BC', 'code', 'dDate')
+            ->selectRaw('ROW_NUMBER() OVER (PARTITION BY BC, code ORDER BY dDate DESC, id DESC) AS cycle_rank')
+            ->whereIn('trans_type', ['PART_PAYMENT', 'REPAWNING']);
+        $latestCycles = DB::query()->fromSub($rankedCycles, 'ranked_letter_cycles')
+            ->select('BC', 'code', 'dDate')->where('cycle_rank', 1);
+
+        return TPawnSum::query()->select('t_pawn_sums.*')
+            ->leftJoinSub($latestCycles, 'latest_letter_cycle', function ($join) {
+                // Match the transaction table's collation on the outer values.
+                // BINARY on both sides prevented the derived-table lookup and
+                // made every page/count scan thousands of transaction rows.
+                $join->whereRaw('latest_letter_cycle.BC = t_pawn_sums.BC COLLATE utf8mb4_general_ci')
+                    ->whereRaw('latest_letter_cycle.code = CONVERT(t_pawn_sums.Receipt_Number USING utf8mb4) COLLATE utf8mb4_general_ci');
+            })
+            ->where('t_pawn_sums.BC', $branchCode)
+            ->where('t_pawn_sums.IsRedeemed', 0)
+            ->where('t_pawn_sums.isForfeit', 0);
+    }
+
+    private function currentLetterTab(TPawnSum $receipt, \App\Services\ReceiptPenaltySchedule $schedule): int
+    {
+        if ($this->hasPriorCycleLetters($receipt)) return 1;
+        if ($receipt->is_letter_3) return 3;
+        if ($receipt->is_letter_2 && ($schedule->letterDueDate($receipt, 3)?->lte(today()) ?? false)) return 3;
+        if ($receipt->is_letter_1 && ($schedule->letterDueDate($receipt, 2)?->lte(today()) ?? false)) return 2;
+        return 1;
+    }
+
+    private function applyStageFilter($query, \App\Services\ReceiptPenaltySchedule $schedule, int $letter, ?string $latestCycleDateSql = null)
+    {
+        $today = today()->toDateString();
+        $priorCycleLetters = $this->priorCycleLettersSql($latestCycleDateSql);
+        // Expired receipts enter the first tab and become printable on expiry.
+        // Later stages remain due-date gated and require the previous letter.
+        // An old letter's due date must never keep a renewed receipt in tab 2/3.
+        $query->whereRaw($schedule->expirySql($latestCycleDateSql).' <= ?', [$today]);
+        if ($letter === 1) {
+            $nextDue = $schedule->letterDueSql(2, $latestCycleDateSql);
+            return $query->where(function ($stage) use ($priorCycleLetters, $nextDue, $today) {
+                $stage->whereRaw($priorCycleLetters)
+                    ->orWhere(function ($current) use ($nextDue, $today) {
+                        $current->where(fn ($next) => $next->whereNull('is_letter_2')
+                            ->orWhere('is_letter_2', 0))
+                            ->where(function ($printed) use ($nextDue, $today) {
+                                $printed->whereNull('is_letter_1')->orWhere('is_letter_1', 0)
+                                    ->orWhereRaw($nextDue.' > ?', [$today])
+                                    ->orWhereRaw($nextDue.' IS NULL');
+                            });
+                    });
+            });
+        }
+
+        $query->whereRaw('NOT '.$priorCycleLetters)
+            ->whereRaw($schedule->letterDueSql($letter, $latestCycleDateSql).' <= ?', [$today]);
+        if ($letter > 1) $query->where('is_letter_'.($letter - 1), 1);
+        if ($letter < 3) {
+            $query->where(fn ($next) => $next->whereNull('is_letter_'.($letter + 1))
+                ->orWhere('is_letter_'.($letter + 1), 0));
+        }
+
+        // An issued letter remains visible, without a print action, until the
+        // next stage is due, counting from this letter's actual print date.
+        $nextDue = $letter < 3
+            ? $schedule->letterDueSql($letter + 1, $latestCycleDateSql)
+            : $schedule->reminderDueSql($latestCycleDateSql);
+        return $query->where(function ($stage) use ($letter, $nextDue, $today) {
+            $stage->whereNull('is_letter_'.$letter)->orWhere('is_letter_'.$letter, 0)
+                ->orWhereRaw($nextDue.' > ?', [$today])
+                ->orWhereRaw($nextDue.' IS NULL');
+        });
+    }
+
+    private function applyPrintedVisibility($query, int $letter, bool $showPrinted, ?string $latestCycleDateSql = null)
+    {
+        if (!$showPrinted) {
+            $query->where(fn ($pending) => $pending->whereNull('is_letter_'.$letter)
+                ->orWhere('is_letter_'.$letter, 0)
+                ->when($letter === 1, fn ($pending) => $pending->orWhereRaw(
+                    $this->priorCycleLettersSql($latestCycleDateSql)
+                )));
+        }
+
+        return $query;
+    }
+
+    private function priorCycleLettersSql(?string $latestCycleDateSql): string
+    {
+        $dates = array_filter([
+            $latestCycleDateSql,
+            't_pawn_sums.RePawning_date',
+            't_pawn_sums.Pawn_Date',
+            't_pawn_sums.Receipt_Date',
+        ]);
+        $cycleStart = 'GREATEST('.implode(', ', array_map(
+            fn ($date) => "COALESCE(DATE({$date}), '1000-01-01')",
+            $dates
+        )).')';
+
+        return '('.implode(' OR ', array_map(
+            fn ($number) => "(COALESCE(t_pawn_sums.is_letter_{$number}, 0) = 1 "
+                ."AND t_pawn_sums.letter_{$number}_date IS NOT NULL "
+                ."AND DATE(t_pawn_sums.letter_{$number}_date) < {$cycleStart})",
+            [1, 2, 3]
+        )).')';
+    }
+
+    private function applyTypeFilter($query, string $type): void
+    {
+        if (strtoupper(trim($type)) === 'SILVER') {
+            $query->where(function ($silver) {
+                $silver->whereRaw("UPPER(TRIM(COALESCE(receiptname, ''))) = 'SILVER'")
+                    ->orWhereRaw("UPPER(TRIM(COALESCE(Receipt_Type, ''))) = 'SILVER'");
+            });
+        } else {
+            $query->where('Receipt_Type', $type);
+        }
+    }
+
+    private function applyCurrentCustomerContact(TPawnSum $receipt, ?Customer $customer = null): void
+    {
+        $customer = $customer ?? Customer::where('NIC', $receipt->Customer_NIC)->where('BC', $receipt->BC)->first();
+        if (!$customer) {
+            return;
+        }
+        $receipt->Customer_Name = $customer->Name ?: trim(implode(' ', array_filter([
+            $customer->First_name, $customer->Middle_name, $customer->Last_name,
+        ])));
+        $receipt->Customer_Address = $customer->Address_1;
+        $receipt->Customer_Phone = $customer->Contact_1;
+    }
+
+}

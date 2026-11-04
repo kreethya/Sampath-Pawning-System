@@ -1,0 +1,400 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\Customer;
+use App\Models\TPawnSum;
+use App\Models\User;
+use Carbon\Carbon;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Tests\TestCase;
+
+// In-memory fixtures only: never connects to or modifies the project database.
+class ForfeitReportRenderingTest extends TestCase
+{
+    protected function tearDown(): void
+    {
+        Carbon::setTestNow();
+        parent::tearDown();
+    }
+
+    public function test_payment_prints_show_day_count_beside_interest_without_changing_amounts(): void
+    {
+        $pawn = ['Customer_Name'=>'Example','Customer_Address'=>'Main Road','Customer_Phone'=>'0771234567',
+            'Customer_NIC'=>'123V','Receipt_Number'=>100,'Invoice_Number'=>300,'Final_date'=>'2026-10-01','Receipt_Date'=>'2026-09-01'];
+        $payment = array_merge(array_fill_keys(['current_pawn_amount','Postage_Charges','Paid_Interest','paid_cap_amount','Payable_Total','Discount','Stamp_Fee','Document_Charges','Original_Pawn_Amount','Payable_Pawn_Amount'],100),
+            ['Receipt_Number'=>100,'Redeem_Date'=>'2026-09-13']);
+        $data = ['pawnSumData'=>collect([$pawn]),'pawnDetailsData'=>collect(),'redeemdata'=>collect([$payment]),
+            'companyData'=>collect(),'branchDetails'=>collect(),'interestDays'=>13];
+        foreach (['partpaymentReceiptPrint','redeemReceiptPrint'] as $template) {
+            $html = view($template, $data)->render();
+            $this->assertStringContainsString('(13 days)', $html);
+            $this->assertStringContainsString('100.00', $html);
+        }
+    }
+
+    public function test_redeem_receipts_print_stock_number_for_admin_and_cashier(): void
+    {
+        $pawn = [
+            'Invoice_Number' => 'STK-300', 'Receipt_Date' => '2026-09-01',
+            'Customer_Name' => 'Example', 'Customer_Address' => 'Main Road',
+            'Customer_NIC' => '123V', 'Customer_Phone' => '0771234567',
+        ];
+        $payment = array_merge(array_fill_keys([
+            'Original_Pawn_Amount', 'Payable_Pawn_Amount', 'Paid_Interest',
+            'Stamp_Fee', 'Postage_Charges', 'Document_Charges', 'Payable_Total',
+            'Discount', 'old_Interest',
+        ], 0), ['Receipt_Number' => 100, 'Redeem_Date' => '2026-09-13']);
+        $data = [
+            'pawnSumData' => collect([$pawn]), 'pawnDetailsData' => collect(),
+            'redeemdata' => collect([$payment]), 'companyData' => collect(),
+            'branchDetails' => collect(), 'interestDays' => 12,
+        ];
+
+        foreach (['Admin', 'Cashier'] as $role) {
+            $this->actingAs((new User())->forceFill(['id' => 1, 'role' => $role, 'BC' => '001']));
+            foreach (['redeemReceiptPrint', 'oldredeemReceiptPrint'] as $template) {
+                $html = view($template, $data)->render();
+                $this->assertStringContainsString('<strong>Stock No:</strong> STK-300', $html);
+            }
+        }
+    }
+
+    public function test_part_payment_print_shows_capitalized_interest_and_recorded_new_capital(): void
+    {
+        $pawn = ['Customer_Name'=>'Example','Customer_Address'=>'Main Road','Customer_Phone'=>'0771234567',
+            'Customer_NIC'=>'123V','Receipt_Number'=>100,'Invoice_Number'=>300,'Final_date'=>'2026-10-01','Receipt_Date'=>'2026-09-01'];
+        $payment = array_merge(array_fill_keys([
+            'current_pawn_amount','Postage_Charges','Paid_Interest','paid_cap_amount',
+            'Payable_Total','Discount','Stamp_Fee','Document_Charges','Original_Pawn_Amount',
+        ], 0), [
+            'Receipt_Number'=>100, 'Redeem_Date'=>'2026-09-13',
+            'current_pawn_amount'=>5000, 'Paid_Interest'=>150,
+            'paid_cap_amount'=>5200, 'Payable_Total'=>150, 'Payable_Pawn_Amount'=>5050,
+        ]);
+
+        $html = view('partpaymentReceiptPrint', [
+            'pawnSumData'=>collect([$pawn]), 'pawnDetailsData'=>collect(),
+            'redeemdata'=>collect([$payment]), 'companyData'=>collect(),
+            'branchDetails'=>collect(), 'interestDays'=>13,
+            'capitalizedInterest'=>50, 'capitalizedCharges'=>125,
+        ])->render();
+
+        $this->assertStringContainsString('Interest Added to Capital', $html);
+        $this->assertStringContainsString('Rs. 50.00', $html);
+        $this->assertStringContainsString('Postage / Charges Added to Capital', $html);
+        $this->assertStringContainsString('Rs. 125.00', $html);
+        $this->assertStringContainsString('Rs. 5,050.00', $html);
+    }
+
+    public function test_only_missed_promise_dates_highlight_reminder_rows(): void
+    {
+        Carbon::setTestNow('2026-09-13');
+        $records = collect(['2026-09-12','2026-09-13','2026-09-14'])->map(function ($date, $index) {
+            $receipt = new TPawnSum(['Receipt_Number'=>100+$index]);
+            $receipt->forceFill([
+                'id'=>$index+1, 'financial_breakdown'=>array_fill_keys(['principal','interest','service_charge','letter_charge','arrears_total','redemption_total'], 0),
+                'current_promise'=>new \App\Models\ForfeitReminderPromise(['promise_date'=>$date, 'status'=>'PENDING']),
+                'can_queue_forfeit'=>false, 'reminder_due_date'=>'2026-09-01',
+                'current_customer_name'=>'Example', 'current_customer_phone'=>'',
+            ]);
+            return $receipt;
+        });
+        $receipts = new LengthAwarePaginator($records, 3, 25, 1, ['path'=>'/forfeit-reminders']);
+        $html = view('forfeitReminderList', compact('receipts'))->render();
+        $this->assertSame(1, substr_count($html, 'class="receipt-summary-row reminder-overdue"'));
+        $this->assertSame(1, substr_count($html, '>Promise overdue</span>'));
+    }
+
+    public function test_article_list_selects_receipts_and_displays_invoice_as_stock_number(): void
+    {
+        $receipt = new TPawnSum(['Receipt_Number'=>100,'Invoice_Number'=>300,'Ticket_Number'=>200]);
+        $receipt->forceFill(['id'=>1,'current_customer_name'=>'Example', 'available_articles'=>collect()]);
+        $recipts = new LengthAwarePaginator([$receipt], 1, 25, 1, ['path'=>'/forfeit_article_receipt']);
+        $html = view('forfeit_article_receipt', compact('recipts'))->render();
+        $this->assertStringContainsString('name="selected_receipts[]" value="1"', $html);
+        $this->assertStringContainsString('<td>300</td>', $html);
+        $this->assertStringContainsString('Forfeit selected &amp; print', $html);
+        $this->assertStringContainsString('data-article-details="articles-1"', $html);
+        $this->assertStringContainsString('sidebar-navigation.js', $html);
+    }
+
+    public function test_transfer_print_contains_frozen_finances_dates_and_operator(): void
+    {
+        $event = new \App\Models\ReceiptLifecycleEvent([
+            'receipt_number'=>100,'created_by'=>'original','event_date'=>'2026-09-13 10:00:00',
+            'event_data'=>json_encode(['stock_number'=>300,'ticket_number'=>200,'forfeited_date'=>'2026-09-01',
+                'capital_outstanding'=>500,'interest_outstanding'=>50,'capital_paid'=>100,'interest_paid'=>20,
+                'operator'=>['name'=>'Original Operator'], 'articles'=>[]]),
+        ]);
+        $html = view('forfeitArticleTransferPrint', ['events'=>collect([$event])])->render();
+        $this->assertStringContainsString('Ticket Number', $html);
+        $this->assertStringContainsString('Stock Number (Invoice Number)', $html);
+        $this->assertStringContainsString('200', $html);
+        $this->assertStringContainsString('300', $html);
+        $this->assertStringContainsString('500.00', $html);
+        $this->assertStringContainsString('50.00', $html);
+    }
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $user = new User();
+        $user->forceFill(['id'=>1, 'role'=>'Admin', 'BC'=>'001', 'Branch'=>'Test', 'username'=>'Test operator']);
+        $this->actingAs($user);
+        view()->share('errors', new \Illuminate\Support\ViewErrorBag());
+    }
+
+    public function test_empty_reminder_page_has_shared_navigation_and_pagination(): void
+    {
+        $receipts = new LengthAwarePaginator([], 0, 25, 1, ['path'=>'/forfeit-reminders']);
+        $html = view('forfeitReminderList', compact('receipts'))->render();
+        $this->assertStringContainsString('sidebar-navigation.js', $html);
+        $this->assertSame(1, substr_count($html, 'id="sidebar-menu"'));
+        $this->assertSame(1, substr_count($html, 'sidebar-navigation.js'));
+        $this->assertStringContainsString('Rows per page', $html);
+        $this->assertStringContainsString('No receipts are currently', $html);
+    }
+
+    public function test_forfeited_receipt_renders_ticket_articles_and_expandable_history(): void
+    {
+        $receipt = new TPawnSum(['Receipt_Number'=>100, 'Ticket_Number'=>200, 'Invoice_Number'=>300, 'Customer_Name'=>'Example', 'isForfeit'=>1]);
+        $receipt->setAttribute('receipt_history', [
+            'customer'=>null,
+            'financial'=>array_fill_keys(['principal','interest','service_charge','letter_charge','arrears_total','redemption_total'], 0),
+            'details'=>collect(), 'timeline'=>collect(),
+        ]);
+        $receipt->setAttribute('forfeit_record', null);
+        $receipt->setAttribute('stock_items', collect());
+        $recipts = new LengthAwarePaginator([$receipt], 30, 25, 1, ['path'=>'/forfeitReceipt_List']);
+        $status = 'all';
+        $html = view('forfeitReceipt_List', compact('recipts', 'status'))->render();
+        $this->assertStringContainsString('Receipt / Stock', $html);
+        $this->assertStringContainsString('Stock: 300', $html);
+        $this->assertStringContainsString('Ticket: 200', $html);
+        $this->assertStringContainsString('Forfeited', $html);
+        $this->assertStringContainsString('data-row-details="forfeit-details-', $html);
+        $this->assertStringContainsString('class="detail-row" hidden', $html);
+        $this->assertStringContainsString('Collapse all', $html);
+        $this->assertStringContainsString('page=2', $html);
+        $this->assertStringNotContainsString('Process Forfeit</a>', $html);
+    }
+
+    public function test_due_reminder_has_manual_review_checkbox_and_promise_form(): void
+    {
+        $receipt = new TPawnSum(['Receipt_Number'=>100, 'Final_date'=>'2026-01-01', 'letter_3_date'=>'2026-03-05']);
+        $receipt->forceFill([
+            'id'=>1, 'financial_breakdown'=>array_fill_keys(['principal','interest','service_charge','letter_charge','arrears_total','redemption_total'], 0),
+            'current_promise'=>null, 'can_queue_forfeit'=>true, 'reminder_due_date'=>'2026-03-26',
+            'current_customer_name'=>'Example', 'current_customer_phone'=>'',
+        ]);
+        $receipts = new LengthAwarePaginator([$receipt], 1, 25, 1, ['path'=>'/forfeit-reminders']);
+        $html = view('forfeitReminderList', compact('receipts'))->render();
+        $this->assertStringContainsString('data-row-details="reminder-details-', $html);
+        $this->assertStringContainsString('name="confirm_forfeit" value="1" required', $html);
+        $this->assertStringContainsString('Move to Forfeit List', $html);
+        $this->assertStringContainsString('Save Promise', $html);
+        $this->assertStringContainsString('2026-03-26', $html);
+    }
+
+    public function test_pawn_customer_panel_shows_the_telephone_as_a_visible_field(): void
+    {
+        $customer = new Customer();
+        $customer->forceFill([
+            'id'=>1, 'First_name'=>'Kamal', 'Last_name'=>'Perera',
+            'Address_1'=>'Main Street', 'Contact_1'=>'0771234567',
+        ]);
+        $customer_get = collect([$customer]);
+        $pending_count = 2;
+        $redeemed_count = 3;
+        $pendingPawnTotal = 15000;
+        $Limit_Amount = 50000;
+        $Limit_Pawn_Count = 5;
+
+        $html = view('pawning_search_customer', compact(
+            'customer_get', 'pending_count', 'redeemed_count', 'pendingPawnTotal',
+            'Limit_Amount', 'Limit_Pawn_Count'
+        ))->render();
+
+        $this->assertStringContainsString('Telephone Number', $html);
+        $this->assertStringContainsString('id="customer_contact_1"', $html);
+        $this->assertStringContainsString('value="0771234567"', $html);
+        $this->assertStringNotContainsString('type="hidden" name="customer_contact_1"', $html);
+    }
+
+    public function test_late_letter_table_removes_address_and_formats_every_date_without_time(): void
+    {
+        $makeReceipt = function (int $id, bool $first, bool $second): TPawnSum {
+            $receipt = new TPawnSum([
+                'Receipt_Number'=>99 + $id, 'Customer_NIC'=>'123V', 'Customer_Name'=>'Example',
+                'Customer_Address'=>'ADDRESS MUST NOT APPEAR', 'Customer_Phone'=>'0771234567',
+                'Receipt_Type'=>'A', 'Receipt_Date'=>'2026-01-02 08:45:12',
+                'Final_date'=>'2026-02-02 09:15:20', 'Amount'=>1000,
+                'is_letter_1'=>$first, 'is_letter_2'=>$second, 'is_letter_3'=>false,
+                'letter_1_date'=>$first ? '2026-02-23 10:11:12' : null,
+                'letter_2_date'=>$second ? '2026-03-16 12:13:14' : null,
+            ]);
+            $receipt->forceFill([
+                'id'=>$id,
+                'next_letter_due_date'=>'2026-04-06',  // stored as Y-m-d string
+                'letter_is_due'=>true,
+                'arrears_expiry_date'=>'2026-02-02',
+                'financial_breakdown'=>array_fill_keys(
+                    ['interest','service_charge','letter_charge','arrears_total','redemption_total'], 0
+                ),
+            ]);
+            return $receipt;
+        };
+
+        // Build a fake paginator for tab 1 (1st letter = receipt id 1)
+        $items1 = collect([$makeReceipt(1, false, false)]);
+        $tab1 = new \Illuminate\Pagination\LengthAwarePaginator($items1, 1, 25, 1);
+
+        $items2 = collect([$makeReceipt(2, true, false)]);
+        $tab2 = new \Illuminate\Pagination\LengthAwarePaginator($items2, 1, 25, 1);
+
+        $items3 = collect([$makeReceipt(3, true, true)]);
+        $tab3 = new \Illuminate\Pagination\LengthAwarePaginator($items3, 1, 25, 1);
+
+        $receiptType = collect();
+        $companyData = collect();
+        $count_1st = 1; $count_2nd = 1; $count_3rd = 1;
+
+        // Render tab 1 view
+        $activeTab = 1;
+        $tab2_null = null; $tab3_null = null;
+        $html = view('redeem_late_letter', [
+            'receiptType' => $receiptType,
+            'companyData' => $companyData,
+            'tab1'        => $tab1,
+            'tab2'        => $tab2_null,
+            'tab3'        => $tab3_null,
+            'count_1st'   => $count_1st,
+            'count_2nd'   => $count_2nd,
+            'count_3rd'   => $count_3rd,
+            'activeTab'   => $activeTab,
+            'showPrinted' => true,
+        ])->render();
+
+        // Address must never appear
+        $this->assertStringNotContainsString('ADDRESS MUST NOT APPEAR', $html);
+        $this->assertStringNotContainsString('<th>Address</th>', $html);
+
+        // Times must not appear (only dates)
+        $this->assertStringNotContainsString('08:45:12', $html);
+        $this->assertStringNotContainsString('11:12:13', $html);
+        $this->assertStringNotContainsString('10:11:12', $html);
+        $this->assertStringNotContainsString('12:13:14', $html);
+
+        // Detail toggle button and expanded panel must be present
+        $this->assertStringContainsString('data-detail-row="ll-detail-1-1"', $html);
+        $this->assertStringContainsString('class="detail-row d-none"', $html);
+        $this->assertStringContainsString('Letter / Postage', $html);
+
+        // Key dates must appear (without time component)
+        $this->assertStringContainsString('2026-01-02', $html);
+        $this->assertStringContainsString('2026-02-02', $html);
+        $this->assertStringContainsString('2026-04-06', $html);
+    }
+
+    public function test_expired_first_letter_is_visible_and_printable_on_expiry(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Number'=>1241, 'Customer_Name'=>'Example', 'Customer_NIC'=>'123V',
+            'Customer_Phone'=>'0771234567', 'Receipt_Type'=>'SILVER',
+            'Receipt_Date'=>'2026-01-24', 'Amount'=>9000, 'is_letter_1'=>false,
+        ]);
+        $receipt->forceFill([
+            'id'=>1241, 'arrears_expiry_date'=>'2026-02-23',
+            'next_letter_due_date'=>'2026-02-23', 'letter_is_due'=>true,
+            'financial_breakdown'=>array_fill_keys(
+                ['interest','service_charge','letter_charge','arrears_total','redemption_total'], 0
+            ),
+        ]);
+        $paginator = new LengthAwarePaginator([$receipt], 1, 25, 1);
+        $html = view('_partials.late_letter_tab', [
+            'paginator'=>$paginator, 'letter_no'=>1, 'chk_class'=>'chk-1',
+            'btn_color'=>'success', 'extra_col_header'=>null, 'extra_col_key'=>null,
+        ])->render();
+
+        $this->assertStringContainsString('2026-02-23', $html);
+        $this->assertStringNotContainsString('Scheduled', $html);
+        $this->assertStringContainsString('class="btn btn-sm btn-success print_letter_btn"', $html);
+        $this->assertStringContainsString('class="row-check chk-1"', $html);
+        $this->assertStringContainsString('Showing 1–1 of 1 receipts, earliest expiry first.', $html);
+    }
+
+    public function test_receipt_history_ledger_renders_debits_credits_balances_and_operator(): void
+    {
+        $ledgerRows = collect([[
+            'date' => '2026-09-09',
+            'description' => 'Part payment received',
+            'summary' => 'Paid capital: Rs. 5,000.00 • Paid interest: Rs. 1,000.00',
+            'details' => ['Paid capital: Rs. 5,000.00', 'Interest: Rs. 600.00 for 14 days'],
+            'dr' => 0,
+            'cr' => 6000,
+            'balance' => 29922.88,
+            'operator' => 'cashier · Test Branch · Branch 001',
+        ]]);
+
+        $html = view('partials.receiptLedgerTable', compact('ledgerRows'))->render();
+
+        foreach (['Date', 'Description', 'DR', 'CR', 'Balance'] as $heading) {
+            $this->assertStringContainsString('>'.$heading.'</th>', $html);
+        }
+        $this->assertStringContainsString('6,000.00', $html);
+        $this->assertStringContainsString('29,922.88', $html);
+        $this->assertStringContainsString('Paid capital: Rs. 5,000.00', $html);
+        $this->assertStringContainsString('data-ledger-detail=', $html);
+        $this->assertStringContainsString('View details', $html);
+        $this->assertStringContainsString('Interest: Rs. 600.00 for 14 days', $html);
+        $this->assertStringContainsString('cashier · Test Branch · Branch 001', $html);
+
+        foreach (['pawningPartPayment.blade.php', 'RedeemReceipt.blade.php', 'repawning.blade.php'] as $template) {
+            $source = file_get_contents(resource_path('views/'.$template));
+            $this->assertStringContainsString("partials.receiptLedgerAssets", $source);
+            $this->assertStringContainsString('historyCurrentBalance', $source);
+        }
+    }
+
+    public function test_receipt_history_print_expands_every_detail_in_black_and_white(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Number' => 4520,
+            'Invoice_Number' => '769116',
+            'Ticket_Number' => 4520,
+            'Customer_Name' => 'Example Customer',
+            'Receipt_Date' => '2026-04-05',
+            'Final_date' => '2027-09-09',
+        ]);
+        $history = [
+            'receipt' => $receipt,
+            'customer' => null,
+            'financial' => array_fill_keys([
+                'principal', 'interest', 'service_charge', 'letter_charge',
+                'arrears_total', 'redemption_total',
+            ], 0),
+            'ledger' => collect([
+                [
+                    'date' => '2026-09-09',
+                    'description' => 'Part payment received',
+                    'summary' => 'Paid capital: Rs. 5,000.00',
+                    'details' => ['Expiry extended to 2027-09-09', 'Receipt #4520 / Stock #769116'],
+                    'dr' => 0,
+                    'cr' => 5000,
+                    'balance' => 10000,
+                    'operator' => 'cashier · Branch 001',
+                ],
+            ]),
+        ];
+
+        $html = view('receiptHistoryPrint', compact('history'))->render();
+
+        $this->assertStringContainsString('Expiry extended to 2027-09-09', $html);
+        $this->assertStringContainsString('cashier · Branch 001', $html);
+        $this->assertStringNotContainsString('View details', $html);
+        $this->assertStringNotContainsString('ledger-detail-row d-none', $html);
+        $this->assertStringContainsString('color: #000', $html);
+        $this->assertStringNotContainsString('color:#c00', $html);
+        $this->assertStringNotContainsString('color:#087f23', $html);
+    }
+}

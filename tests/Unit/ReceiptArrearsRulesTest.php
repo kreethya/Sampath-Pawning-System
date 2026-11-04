@@ -1,0 +1,204 @@
+<?php
+
+namespace Tests\Unit;
+
+use App\Models\TPawnSum;
+use App\Models\Recei_Add;
+use App\Services\ArrearsLetterService;
+use App\Services\ReceiptFinancialCalculator;
+use App\Services\ReceiptLifecycleService;
+use App\Services\ReceiptTypeResolver;
+use Carbon\Carbon;
+use Tests\TestCase;
+
+class ReceiptArrearsRulesTest extends TestCase
+{
+    public function test_letter_due_dates_are_anchored_to_expiry(): void
+    {
+        $receipt = new TPawnSum([
+            'Final_date' => '2026-01-10',
+            'letter_1_date' => '2026-01-10',
+            'letter_2_date' => '2026-01-31',
+        ]);
+        $service = new ArrearsLetterService(new ReceiptFinancialCalculator(), new ReceiptLifecycleService());
+
+        $this->assertSame('2026-01-10', $service->dueDate($receipt, 1)->toDateString());
+        $this->assertSame('2026-01-31', $service->dueDate($receipt, 2)->toDateString());
+        $this->assertSame('2026-02-21', $service->dueDate($receipt, 3)->toDateString());
+    }
+
+    public function test_late_first_letter_starts_the_next_interval(): void
+    {
+        $receipt = new TPawnSum([
+            'Final_date' => '2026-01-01', 'letter_1_days' => 0,
+            'letter_2_days' => 21, 'letter_3_days' => 21,
+            'is_letter_1' => 1, 'letter_1_date' => '2026-02-10',
+        ]);
+        $service = new ArrearsLetterService(new ReceiptFinancialCalculator(), new ReceiptLifecycleService());
+        $this->assertSame('2026-03-03', $service->dueDate($receipt, 2)->toDateString());
+        $this->assertFalse($service->isEligible($receipt, 2, Carbon::parse('2026-02-10')));
+        $this->assertTrue($service->isEligible($receipt, 2, Carbon::parse('2026-03-03')));
+    }
+
+    public function test_expired_receipt_can_print_on_expiry_despite_old_first_interval(): void
+    {
+        $receipt = new TPawnSum(['Final_date'=>'2026-10-01', 'letter_1_days'=>14]);
+        $service = new ArrearsLetterService(new ReceiptFinancialCalculator(), new ReceiptLifecycleService());
+
+        $this->assertFalse($service->isEligible($receipt, 1, Carbon::parse('2026-09-30')));
+        $this->assertTrue($service->isEligible($receipt, 1, Carbon::parse('2026-10-01')));
+    }
+
+    public function test_old_letter_cannot_advance_a_new_expiry_cycle(): void
+    {
+        $receipt = new TPawnSum([
+            'Final_date' => '2026-10-01', 'Pawn_Date' => '2026-09-01',
+            'is_letter_1' => 1, 'letter_1_date' => '2026-08-01',
+            'letter_2_days' => 14,
+        ]);
+        $service = new ArrearsLetterService(new ReceiptFinancialCalculator(), new ReceiptLifecycleService());
+
+        $this->assertFalse($service->isEligible($receipt, 2, Carbon::parse('2026-10-14')));
+    }
+
+    public function test_service_and_letter_charges_are_included_in_arrears(): void
+    {
+        Carbon::setTestNow('2026-01-10');
+        $receipt = new TPawnSum([
+            'Receipt_Type' => 'A', 'receiptname' => 'A',
+            'Pawn_Amount' => 10000, 'Pawn_Date' => '2026-01-01',
+            'RePawning_date' => '2026-01-01', 'period1' => 10,
+            'period2' => 15, 'validPeriod' => 90, 'rate1' => 1,
+            'rate2' => 2, 'rate3' => 2.5, 'service_charge' => 60,
+            'letter_pay_one' => 125, 'letter_pay_two' => 125,
+            'letter_pay_three' => 0, 'interest_Paid' => 0,
+            'BalanceInterest' => 0,
+        ]);
+
+        $result = (new ReceiptFinancialCalculator())->calculate($receipt);
+
+        $this->assertSame(100.0, $result['interest']);
+        $this->assertSame(60.0, $result['service_charge']);
+        $this->assertSame(250.0, $result['letter_charge']);
+        $this->assertSame([1 => 125.0, 2 => 125.0, 3 => 0.0], $result['letter_charges']);
+        $this->assertSame(410.0, $result['arrears_total']);
+        $this->assertSame(10410.0, $result['redemption_total']);
+        Carbon::setTestNow();
+    }
+
+    public function test_zero_imported_postage_uses_the_receipt_type_version_from_the_pawn_cycle(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Type' => 'C', 'receiptname' => 'C',
+            'Receipt_Number' => 2241,
+            'Receipt_Date' => '2026-03-15', 'Pawn_Date' => '2026-05-21',
+            'Postage_charge' => 0, 'is_letter_1' => 1, 'letter_pay_one' => 0,
+        ]);
+        $version = new Recei_Add(['Postage_charge' => 125]);
+        $resolver = $this->createMock(ReceiptTypeResolver::class);
+        $resolver->expects($this->exactly(2))->method('resolveByDate')
+            ->with('C', $this->callback(fn ($date) => Carbon::parse($date)->toDateString() === '2026-05-21'))
+            ->willReturn($version);
+
+        $calculator = new ReceiptFinancialCalculator($resolver);
+        $this->assertSame(125.0, $calculator->postageCharge($receipt));
+        $this->assertSame(125.0, $calculator->resolveLetterCharge($receipt, 1));
+    }
+
+    public function test_missing_legacy_letter_amount_uses_receipt_type_rate_not_aggregate_transaction_postage(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Number' => 413, 'Receipt_Type' => 'SILVER', 'receiptname' => 'SILVER',
+            'Receipt_Date' => '2026-01-21', 'Pawn_Date' => '2026-06-23',
+            'Postage_charge' => 0, 'is_letter_1' => 1, 'letter_pay_one' => 0,
+            'period1' => 10, 'period2' => 15, 'period3' => 30,
+            'validPeriod' => 0, 'rate1' => 6, 'rate2' => 6, 'rate3' => 6,
+            'service_charge' => 0,
+        ]);
+        $resolver = $this->createMock(ReceiptTypeResolver::class);
+        $resolver->expects($this->exactly(2))->method('resolveByDate')
+            ->with('SILVER', $this->anything())
+            ->willReturn(new Recei_Add(['Postage_charge' => 125]));
+
+        $calculator = new ReceiptFinancialCalculator($resolver);
+        $this->assertSame(125.0, $calculator->resolveLetterCharge($receipt, 1));
+        $this->assertSame(125.0, $calculator->calculate($receipt, '2026-06-23')['letter_charges'][1]);
+    }
+
+    public function test_positive_receipt_postage_snapshot_is_preserved(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Type' => 'A', 'Pawn_Date' => '2026-05-21', 'Postage_charge' => 75,
+        ]);
+        $resolver = $this->createMock(ReceiptTypeResolver::class);
+        $resolver->expects($this->never())->method('resolveByDate');
+
+        $this->assertSame(75.0, (new ReceiptFinancialCalculator($resolver))->postageCharge($receipt));
+    }
+
+    public function test_open_receipt_uses_current_noninterest_terms_but_preserves_old_printed_letter(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Type' => 'A', 'receiptname' => 'A',
+            'Pawn_Date' => '2026-09-01', 'Pawn_Amount' => 10000,
+            'rate1' => 1, 'rate2' => 2, 'rate3' => 2.5,
+            'period1' => 10, 'period2' => 15, 'period3' => 30,
+            'validPeriod' => 90, 'service_charge' => 30,
+            'Postage_charge' => 125, 'is_letter_1' => 1,
+            'letter_1_date' => '2026-10-01', 'letter_pay_one' => 0,
+        ]);
+        $receipt->exists = true;
+        $resolver = $this->createMock(ReceiptTypeResolver::class);
+        $resolver->method('resolveByDate')->willReturnCallback(function ($name, $date) {
+            $day = Carbon::parse($date)->toDateString();
+            return new Recei_Add([
+                'service_charge' => $day >= '2026-10-06' ? 60 : 30,
+                'Postage_charge' => $day >= '2026-10-06' ? 150 : 125,
+            ]);
+        });
+
+        $calculator = new ReceiptFinancialCalculator($resolver);
+        $this->assertSame(150.0, $calculator->postageCharge($receipt, '2026-10-11'));
+        $this->assertSame(125.0, $calculator->resolveLetterCharge($receipt, 1));
+        $current = $calculator->calculate($receipt, '2026-10-11');
+        $this->assertSame(60.0, $current['service_charge']);
+        $this->assertSame(125.0, $current['letter_charge']);
+        $this->assertSame(30.0, $calculator->calculate($receipt, '2026-10-01')['service_charge']);
+    }
+
+    public function test_closed_receipt_keeps_its_saved_service_and_postage(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Type' => 'A', 'receiptname' => 'A',
+            'Pawn_Date' => '2026-09-01', 'Pawn_Amount' => 10000,
+            'rate1' => 1, 'rate2' => 2, 'rate3' => 2.5,
+            'period1' => 10, 'period2' => 15, 'period3' => 30,
+            'validPeriod' => 90, 'service_charge' => 30,
+            'Postage_charge' => 125, 'IsRedeemed' => 1,
+        ]);
+        $receipt->exists = true;
+        $resolver = $this->createMock(ReceiptTypeResolver::class);
+        $resolver->expects($this->never())->method('resolveByDate');
+        $calculator = new ReceiptFinancialCalculator($resolver);
+
+        $this->assertSame(30.0, $calculator->calculate($receipt, '2026-10-11')['service_charge']);
+        $this->assertSame(125.0, $calculator->postageCharge($receipt, '2026-10-11'));
+    }
+
+    public function test_same_day_after_paid_interest_has_no_new_interest_even_if_type_has_service_charge(): void
+    {
+        $receipt = new TPawnSum([
+            'Receipt_Type' => 'A', 'receiptname' => 'A',
+            'Pawn_Amount' => 10000, 'Pawn_Date' => '2026-09-11',
+            'RePawning_date' => '2026-09-11', 'period1' => 10,
+            'period2' => 15, 'period3' => 30, 'validPeriod' => 90,
+            'rate1' => 1, 'rate2' => 2, 'rate3' => 2.5,
+            'service_charge' => 60, 'interest_Paid' => 0,
+            'BalanceInterest' => 0,
+        ]);
+        $financial = (new ReceiptFinancialCalculator())->calculate($receipt, '2026-09-10');
+        $this->assertSame(0, $financial['days']);
+        $this->assertSame(0.0, $financial['interest']);
+        $this->assertSame(60.0, $financial['service_charge']);
+    }
+}
