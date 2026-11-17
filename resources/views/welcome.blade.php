@@ -6,11 +6,6 @@
       <meta name="author" content="CodePel">
       <title> login Page</title>
 
-      <!-- Style CSS -->
-      <link rel="stylesheet" href="./css/style.css">
-      <!-- Demo CSS (No need to include it into your project) -->
-
-      <link rel="stylesheet" href="./css/demo.css">
       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-rbsA2VBKQhggwzxH7pPCaAqO46MgnOM80zW1RWuH61DGLwZJEdK2Kadq2F9CUG65" crossorigin="anonymous">
 
       <style>
@@ -41,6 +36,9 @@
   <div class="shadow-lg p-3 mb-5 bg-body-tertiary rounded">
     <form action="{{ route('login') }}" method="post">
       @csrf
+      @if ($errors->any())
+        <div class="alert alert-danger py-2">{{ $errors->first() }}</div>
+      @endif
       <!-- Email input -->
       <div class="form-outline mb-4">
         <label class="lead" for="form3Example3"><strong>User Name</strong></label>
@@ -79,7 +77,6 @@
     </footer>
 
       <!-- Script JS -->
-      <script src="./js/script.js"></script>
       <!--$%analytics%$-->
    </body>
 </html>
